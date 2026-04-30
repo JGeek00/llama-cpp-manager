@@ -18,6 +18,7 @@ Rootless management script for installing, compiling and running llama.cpp as a 
 - CMake
 - C/C++ compiler
 - For CUDA: NVIDIA drivers and CUDA toolkit
+- **Linger enabled for user**: Required for systemd user services to start at login
 
 **Check if Nvidia drivers and CUDA toolkit are properly installed**
 - Run `nvidia-smi` to get the driver version and the CUDA version of the driver
@@ -54,6 +55,14 @@ Now you can run the manager script:
 ```bash
 llama-cpp-manager install
 ```
+
+**IMPORTANT: Before running the installation, enable linger for your user:**
+
+```bash
+loginctl enable-linger $USER
+```
+
+This command is **required** for systemd user services to start automatically when you log in. Without it, the llama.cpp service will not persist across sessions or start at boot.
 
 This will:
 - Clone the llama.cpp repository
@@ -132,6 +141,23 @@ This will:
 3. Restart the daemon automatically
 
 ## Systemd Service
+
+**IMPORTANT: Before using systemd user services, enable linger for your user:**
+
+```bash
+loginctl enable-linger $USER
+```
+
+This command is **required** for the llama.cpp service to:
+- Start automatically when you log in
+- Persist across sessions
+- Run as a background service without user interaction
+
+**Check if linger is enabled:**
+```bash
+loginctl show-user $USER | grep Linger
+# Should show: Linger=yes
+```
 
 The service is configured automatically during installation. You can manage it manually with:
 
@@ -215,4 +241,5 @@ systemctl --user restart llama-cpp.service
 - Script runs in rootless mode, no sudo required
 - Models must be placed manually in `~/.local/share/llama.cpp/models/`
 - Service restarts automatically if it fails
+- **Linger must be enabled for user**: Run `loginctl enable-linger $USER` for systemd user services to work
 - For more information about llama.cpp, visit: https://github.com/ggml-org/llama.cpp
