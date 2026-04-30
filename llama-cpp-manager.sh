@@ -45,16 +45,16 @@ ensure_dirs() {
 show_help() {
 cat <<EOF
 USAGE:
-  $(basename "$0") <command> [--overwrite]
+   $(basename "$0") <command> [--overwrite]
 
 COMMANDS:
-  install [--overwrite]
-  install-mcp-proxy [--overwrite]
-  upgrade
-  regenerate-start-script
-  restart-daemon
-  stop-daemon
-  status
+   install [--overwrite]              Clone, build and install llama.cpp with systemd service
+   install-mcp-proxy [--overwrite]    Install MCP proxy servers (time, fetch, ddg-search)
+   upgrade                            Update llama.cpp to latest version and restart service
+   regenerate-start-script            Regenerate start scripts without changing configs
+   restart-daemon                     Restart llama-cpp and mcp services
+   stop-daemon                        Stop all llama-cpp services
+   status                             Show status of all llama-cpp services
 EOF
 }
 
@@ -171,7 +171,6 @@ EOF
     log "Created $CONFIG_MCP"
 }
 
-# CORREGIDO: vuelve a incluir bloque time usando timezone del config-mcp
 create_mcp_json() {
     local overwrite="$1"
     local timezone="Europe/Madrid"
