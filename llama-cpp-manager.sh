@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# llama-cpp-manager (rootless version)
+# llama-cpp-manager
 #
 
 set -euo pipefail
@@ -9,28 +9,25 @@ set -euo pipefail
 # Paths
 ########################################
 
-# Main installation directory
 BASE_DIR="$HOME/.local/share/llama.cpp"
 BUILD_DIR="$BASE_DIR/build"
 
-# Config and models located inside the base directory
-CONFIG_FILE="$BASE_DIR/config"
-MODELS_DIR="$BASE_DIR/models"
+CONFIG_LLAMA="$BASE_DIR/config-llama-cpp"
+CONFIG_MCP="$BASE_DIR/config-mcp"
+MCP_JSON="$BASE_DIR/mcp.json"
 
-# Path for the shared libraries (.so files)
+MODELS_DIR="$BASE_DIR/models"
 LIB_DIR="$BUILD_DIR/bin"
 
-BIN_DIR="$HOME/.local/bin"
-
-# Script to launch the server
 SCRIPT_FILE="$BASE_DIR/start-llama-cpp.sh"
+MCP_SCRIPT="$BASE_DIR/start-mcp-server.sh"
 
 LOG_DIR="$HOME/.cache/llama.cpp"
 LOG_FILE="$LOG_DIR/llama-cpp.log"
 
-# Systemd user service paths
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SYSTEMD_DIR/llama-cpp.service"
+MCP_SERVICE_FILE="$SYSTEMD_DIR/llama-cpp-mcp.service"
 
 TMP_DIR="/tmp/llama.cpp-build.$$"
 REPO_URL="https://github.com/ggml-org/llama.cpp.git"
@@ -39,69 +36,180 @@ REPO_URL="https://github.com/ggml-org/llama.cpp.git"
 # Utils
 ########################################
 
-log() {
-    echo "[llama-cpp-manager] $*"
-}
+log() { echo "[llama-cpp-manager] $*"; }
 
 ensure_dirs() {
-    mkdir -p "$BASE_DIR"
-    mkdir -p "$MODELS_DIR"
-    mkdir -p "$BIN_DIR"
-    mkdir -p "$LOG_DIR"
-    mkdir -p "$SYSTEMD_DIR"
+    mkdir -p "$BASE_DIR" "$LOG_DIR" "$SYSTEMD_DIR"
 }
 
 show_help() {
-    cat <<EOF
-
-Llama.cpp Manager (Rootless)
-----------------------------
-This script manages the installation, compilation, and background execution 
-of llama.cpp as a user-level systemd service.
-
+cat <<EOF
 USAGE:
-  $(basename "$0") [command]
+  $(basename "$0") <command> [--overwrite]
 
-AVAILABLE COMMANDS:
-  install                  Full setup: clones, compiles with CUDA, creates config,
-                           models directory, launcher script, and systemd service.
-  upgrade                  Fetches the latest version from GitHub, recompiles everything,
-                           and restarts the background daemon.
-  regenerate-start-script  Updates the launcher script logic (start-llama-cpp.sh) 
-                           without recompiling. Use this if you update the manager script.
-  restart-daemon           Restarts the llama-cpp systemd user service to apply changes.
-  stop-daemon              Stops the llama-cpp systemd user service.
-  status                   Shows the current systemd status and recent log output.
-  help, -h, --help         Displays this help message with available options.
-
-FILES & DIRECTORIES:
-  Installation Dir:  $BASE_DIR
-  Configuration:     $CONFIG_FILE
-  Models Dir:        $MODELS_DIR
-  Logs:              $LOG_FILE
-
+COMMANDS:
+  install [--overwrite]
+  install-mcp-proxy [--overwrite]
+  upgrade
+  regenerate-start-script
+  restart-daemon
+  stop-daemon
+  status
 EOF
 }
 
+has_flag() {
+    [[ "${2:-}" == "--overwrite" ]]
+}
+
+require_llama_installed() {
+    if [[ ! -x "$BUILD_DIR/bin/llama-server" ]]; then
+        echo "Error: llama.cpp no está instalado."
+        echo "Primero ejecuta:"
+        echo "  $(basename "$0") install"
+        exit 1
+    fi
+}
+
+get_llama_port() {
+    local port="8080"
+
+    if [[ -f "$CONFIG_LLAMA" ]]; then
+        port="$(grep -i '^port:' "$CONFIG_LLAMA" | head -n1 | cut -d: -f2- | xargs || true)"
+    fi
+
+    [[ "$port" =~ ^[0-9]+$ ]] || port="8080"
+    echo "$port"
+}
+
+get_default_mcp_port() {
+    local p
+    p="$(get_llama_port)"
+    echo $((p + 1))
+}
+
 ########################################
-# Configuration and Models setup
+# Build llama.cpp
 ########################################
 
-create_config() {
-    mkdir -p "$MODELS_DIR"
-    
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat > "$CONFIG_FILE" <<EOF
+build_llama() {
+    rm -rf "$TMP_DIR"
+    git clone --depth 1 "$REPO_URL" "$TMP_DIR"
+
+    cd "$TMP_DIR"
+    cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j"$(nproc)"
+
+    rm -rf "$BUILD_DIR"
+    mv build "$BUILD_DIR"
+
+    cd /
+    rm -rf "$TMP_DIR"
+}
+
+########################################
+# Config llama.cpp
+########################################
+
+create_llama_config() {
+    local overwrite="$1"
+
+    if [[ -f "$CONFIG_LLAMA" && "$overwrite" != "yes" ]]; then
+        log "Keeping existing $CONFIG_LLAMA"
+        return
+    fi
+
+cat > "$CONFIG_LLAMA" <<EOF
 host: 0.0.0.0
 port: 8080
 EOF
-        log "Default config created at: $CONFIG_FILE"
+
+    log "Created $CONFIG_LLAMA"
+}
+
+create_models_dir() {
+    local overwrite="$1"
+
+    if [[ -d "$MODELS_DIR" && "$overwrite" != "yes" ]]; then
+        log "Keeping existing $MODELS_DIR"
+        return
     fi
-    log "Models directory ensured at: $MODELS_DIR"
+
+    rm -rf "$MODELS_DIR"
+    mkdir -p "$MODELS_DIR"
+    log "Created $MODELS_DIR"
+}
+
+ensure_webui_mcp_proxy_flag() {
+    [[ -f "$CONFIG_LLAMA" ]] || return
+
+    if ! grep -Fxq "webui-mcp-proxy" "$CONFIG_LLAMA"; then
+        echo "webui-mcp-proxy" >> "$CONFIG_LLAMA"
+        log "Added webui-mcp-proxy to $CONFIG_LLAMA"
+    fi
 }
 
 ########################################
-# Server start script generation
+# Config MCP
+########################################
+
+create_mcp_config() {
+    local overwrite="$1"
+    local port
+    port="$(get_default_mcp_port)"
+
+    if [[ -f "$CONFIG_MCP" && "$overwrite" != "yes" ]]; then
+        log "Keeping existing $CONFIG_MCP"
+        return
+    fi
+
+cat > "$CONFIG_MCP" <<EOF
+PORT: $port
+TIMEZONE: Europe/Madrid
+EOF
+
+    log "Created $CONFIG_MCP"
+}
+
+# CORREGIDO: vuelve a incluir bloque time usando timezone del config-mcp
+create_mcp_json() {
+    local overwrite="$1"
+    local timezone="Europe/Madrid"
+
+    if [[ -f "$CONFIG_MCP" ]]; then
+        timezone="$(grep -i '^TIMEZONE:' "$CONFIG_MCP" | head -n1 | cut -d: -f2- | xargs || true)"
+        [[ -n "$timezone" ]] || timezone="Europe/Madrid"
+    fi
+
+    if [[ -f "$MCP_JSON" && "$overwrite" != "yes" ]]; then
+        log "Keeping existing $MCP_JSON"
+        return
+    fi
+
+cat > "$MCP_JSON" <<EOF
+{
+  "mcpServers": {
+    "time": {
+      "command": "uvx",
+      "args": ["mcp-server-time", "--local-timezone=$timezone"]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    },
+    "ddg-search": {
+      "command": "uvx",
+      "args": ["duckduckgo-mcp-server"]
+    }
+  }
+}
+EOF
+
+    log "Created $MCP_JSON"
+}
+
+########################################
+# Start scripts
 ########################################
 
 create_start_script() {
@@ -109,74 +217,106 @@ cat > "$SCRIPT_FILE" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fix for "error while loading shared libraries"
-export LD_LIBRARY_PATH="$LIB_DIR:\${LD_LIBRARY_PATH:-}"
+BUILD_DIR="$BUILD_DIR"
+LIB_DIR="$LIB_DIR"
+CONFIG_FILE="$CONFIG_LLAMA"
 
-CONFIG_FILE="$CONFIG_FILE"
-BIN="$BUILD_DIR/bin/llama-server"
+export LD_LIBRARY_PATH="\$LIB_DIR:\${LD_LIBRARY_PATH:-}"
 
-if [[ ! -x "\$BIN" ]]; then
-    echo "Error: llama-server not found at \$BIN"
-    exit 1
-fi
+BIN="\$BUILD_DIR/bin/llama-server"
+
+[[ -x "\$BIN" ]] || { echo "llama-server not found"; exit 1; }
+[[ -f "\$CONFIG_FILE" ]] || { echo "config missing"; exit 1; }
 
 ARGS=()
 
-# Parse YAML-like config into CLI arguments
 while IFS= read -r line || [[ -n "\$line" ]]; do
     line="\$(echo "\$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
     [[ -z "\$line" ]] && continue
     [[ "\$line" =~ ^# ]] && continue
 
     if [[ "\$line" == *:* ]]; then
-        # Key: Value argument
         key="\${line%%:*}"
         value="\${line#*:}"
         key="\$(echo "\$key" | xargs)"
         value="\$(echo "\$value" | xargs)"
         ARGS+=("--\$key" "\$value")
     else
-        # Boolean Flag argument
         key="\$(echo "\$line" | xargs)"
         ARGS+=("--\$key")
     fi
 done < "\$CONFIG_FILE"
 
-echo "[launcher] Starting llama-server with LD_LIBRARY_PATH=\$LD_LIBRARY_PATH"
 exec "\$BIN" "\${ARGS[@]}"
 EOF
 
 chmod +x "$SCRIPT_FILE"
-log "Start script updated at: $SCRIPT_FILE"
+}
+
+create_mcp_start_script() {
+cat > "$MCP_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="$CONFIG_MCP"
+JSON_FILE="$MCP_JSON"
+
+UVX_BIN="\$HOME/.local/bin/uvx"
+[[ -x "\$UVX_BIN" ]] || UVX_BIN="\$(command -v uvx || true)"
+
+[[ -x "\$UVX_BIN" ]] || { echo "uvx not found"; exit 1; }
+[[ -f "\$CONFIG_FILE" ]] || { echo "config-mcp missing"; exit 1; }
+
+PORT="\$(grep -i '^PORT:' "\$CONFIG_FILE" | head -n1 | cut -d: -f2- | xargs || true)"
+TIMEZONE="\$(grep -i '^TIMEZONE:' "\$CONFIG_FILE" | head -n1 | cut -d: -f2- | xargs || true)"
+
+[[ "\$PORT" =~ ^[0-9]+$ ]] || { echo "Invalid PORT"; exit 1; }
+[[ -n "\$TIMEZONE" ]] || { echo "TIMEZONE missing"; exit 1; }
+[[ -f "/usr/share/zoneinfo/\$TIMEZONE" ]] || { echo "Invalid TIMEZONE"; exit 1; }
+
+cat > "\$JSON_FILE" <<JSON
+{
+  "mcpServers": {
+    "time": {
+      "command": "uvx",
+      "args": ["mcp-server-time", "--local-timezone=\$TIMEZONE"]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    },
+    "ddg-search": {
+      "command": "uvx",
+      "args": ["duckduckgo-mcp-server"]
+    }
+  }
+}
+JSON
+
+exec "\$UVX_BIN" mcp-proxy \
+  --named-server-config "\$JSON_FILE" \
+  --allow-origin "*" \
+  --port "\$PORT" \
+  --stateless
+EOF
+
+chmod +x "$MCP_SCRIPT"
 }
 
 ########################################
-# PATH Management
+# Services
 ########################################
 
-ensure_path() {
-    local line='export PATH="$HOME/.local/bin:$PATH"'
-    touch "$HOME/.bashrc"
-    if ! grep -Fq '.local/bin' "$HOME/.bashrc"; then
-        echo "$line" >> "$HOME/.bashrc"
-        log "PATH updated in .bashrc"
-    fi
-}
-
-########################################
-# Systemd user service
-########################################
-
-create_service() {
+create_llama_service() {
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=llama.cpp daemon (user)
+Description=llama.cpp daemon
 After=default.target
 
 [Service]
 Type=simple
 WorkingDirectory=$BASE_DIR
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=$SCRIPT_FILE
 Restart=always
 RestartSec=5
@@ -186,86 +326,126 @@ StandardError=append:$LOG_FILE
 [Install]
 WantedBy=default.target
 EOF
+}
 
+create_mcp_service() {
+cat > "$MCP_SERVICE_FILE" <<EOF
+[Unit]
+Description=llama.cpp MCP proxy
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=$BASE_DIR
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=$MCP_SCRIPT
+Restart=always
+RestartSec=5
+StandardOutput=append:$LOG_FILE
+StandardError=append:$LOG_FILE
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+reload_systemd() {
     systemctl --user daemon-reload
-    systemctl --user enable llama-cpp.service >/dev/null
-    log "Systemd user service created and enabled"
 }
 
 ########################################
-# Compilation Logic
-########################################
-
-build_llama() {
-    rm -rf "$TMP_DIR"
-    log "Cloning llama.cpp repository..."
-    git clone --depth 1 "$REPO_URL" "$TMP_DIR"
-
-    cd "$TMP_DIR"
-    log "Building llama.cpp with CUDA support..."
-    cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-    cmake --build build -j"$(nproc)"
-
-    rm -rf "$BUILD_DIR"
-    mv build "$BUILD_DIR"
-    rm -rf "$TMP_DIR"
-    log "Build completed and moved to $BUILD_DIR"
-}
-
-########################################
-# Command Handlers
+# Commands
 ########################################
 
 install_cmd() {
+    local overwrite="no"
+    has_flag "$@" && overwrite="yes"
+
     ensure_dirs
-    log "Starting installation..."
     build_llama
-    create_config
+    create_llama_config "$overwrite"
+    create_models_dir "$overwrite"
     create_start_script
-    ensure_path
-    create_service
-    log "Installation finished successfully"
+    create_llama_service
+
+    reload_systemd
+    systemctl --user enable llama-cpp.service >/dev/null
+}
+
+install_mcp_cmd() {
+    local overwrite="no"
+    has_flag "$@" && overwrite="yes"
+
+    require_llama_installed
+    ensure_dirs
+    ensure_webui_mcp_proxy_flag
+    create_mcp_config "$overwrite"
+    create_mcp_json "$overwrite"
+    create_mcp_start_script
+    create_mcp_service
+
+    reload_systemd
+    systemctl --user enable llama-cpp-mcp.service >/dev/null
+
+    echo
+    echo "IMPORTANT:"
+    echo "Check $CONFIG_MCP"
+    echo "Set TIMEZONE to your real timezone."
+    echo "Example: Europe/Madrid"
 }
 
 upgrade_cmd() {
-    log "Upgrading llama.cpp..."
+    require_llama_installed
     build_llama
     create_start_script
-    systemctl --user restart llama-cpp.service
-    log "Upgrade and restart completed"
+    reload_systemd
+    systemctl --user restart llama-cpp.service || true
 }
 
-regenerate_script_cmd() {
-    log "Regenerating start script..."
+regenerate_cmd() {
+    require_llama_installed
     create_start_script
-    log "Start script has been regenerated. Restart the daemon to apply changes."
-}
 
-status_cmd() {
-    systemctl --user status llama-cpp.service --no-pager
+    if [[ -f "$MCP_SCRIPT" ]]; then
+        create_mcp_start_script
+    fi
+
+    reload_systemd
 }
 
 restart_cmd() {
-    systemctl --user restart llama-cpp.service
-    log "Daemon restarted"
+    systemctl --user restart llama-cpp.service || true
+    [[ -f "$MCP_SERVICE_FILE" ]] && systemctl --user restart llama-cpp-mcp.service || true
 }
 
 stop_cmd() {
-    systemctl --user stop llama-cpp.service
-    log "Daemon stopped"
+    systemctl --user stop llama-cpp.service || true
+    systemctl --user stop llama-cpp-mcp.service || true
+}
+
+status_cmd() {
+    echo "=== llama-cpp ==="
+    systemctl --user status llama-cpp.service --no-pager || true
+    echo
+    echo "=== llama-cpp-mcp ==="
+    systemctl --user status llama-cpp-mcp.service --no-pager || true
 }
 
 ########################################
-# Main Entry Point
+# Main
 ########################################
 
 case "${1:-}" in
-    install)                 install_cmd ;;
-    upgrade)                 upgrade_cmd ;;
-    regenerate-start-script) regenerate_script_cmd ;;
-    restart-daemon)          restart_cmd ;;
-    stop-daemon)             stop_cmd ;;
-    status)                  status_cmd ;;
-    help|--help|-h)          show_help ;;
-    *)                       show_help; exit 1 ;;
+    install) install_cmd "$@" ;;
+    install-mcp-proxy) install_mcp_cmd "$@" ;;
+    upgrade) upgrade_cmd ;;
+    regenerate-start-script) regenerate_cmd ;;
+    restart-daemon) restart_cmd ;;
+    stop-daemon) stop_cmd ;;
+    status) status_cmd ;;
+    help|--help|-h|"") show_help ;;
+    *)
+        show_help
+        exit 1
+        ;;
 esac
