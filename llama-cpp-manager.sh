@@ -109,7 +109,7 @@ build_llama() {
     cmake \
         -B build \
         -DGGML_CUDA=ON \
-        -DGGML_CUDA_FA_ALL_QUANTS \
+        -DGGML_CUDA_FA_ALL_QUANTS=ON \
         -DCMAKE_BUILD_TYPE=Release
 
     cmake --build build -j"$(nproc)"
