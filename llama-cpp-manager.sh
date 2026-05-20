@@ -307,25 +307,6 @@ TIMEZONE="\$(grep -i '^TIMEZONE:' "\$CONFIG_FILE" | head -n1 | cut -d: -f2- | xa
     exit 1
 }
 
-cat > "\$JSON_FILE" <<JSON
-{
-  "mcpServers": {
-    "time": {
-      "command": "uvx",
-      "args": ["mcp-server-time", "--local-timezone=\$TIMEZONE"]
-    },
-    "fetch": {
-      "command": "uvx",
-      "args": ["mcp-server-fetch"]
-    },
-    "ddg-search": {
-      "command": "uvx",
-      "args": ["duckduckgo-mcp-server"]
-    }
-  }
-}
-JSON
-
 exec "\$UVX_BIN" mcp-proxy \
   --named-server-config "\$JSON_FILE" \
   --allow-origin "*" \
